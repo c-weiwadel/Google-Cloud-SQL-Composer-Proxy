@@ -23,7 +23,23 @@ def _get_args():
 def get_configs(path):
     config = configparser.ConfigParser()
     config.read(path)
-    return dict(config.items('default'))
+    config_dict = dict(config.items('default'))
+    db_secret_name = [ config_dict.get('db_prod_secret_name'), config_dict.get('db_dev_secret_name')] 
+    
+    config_dict['db_secret_name'] = [ item for item in db_secret_name if item]
+    
+    prod_instance_conn = f"{config_dict['prod_project']}:{config_dict['region_name']}:{config_dict['db_instance']}?address=0.0.0.0&port={config_dict['prod_proxy_port']}"
+    dev_instance_conn = f"{config_dict['dev_project']}:{config_dict['region_name']}:{config_dict['db_instance']}?address=0.0.0.0&port={config_dict['dev_proxy_port']}"
+
+    # ; "ratequote-349719:us-central1:call-optimizer-db?address=0.0.0.0&port=3307" \
+    # ; "ratequotedev:us-central1:call-optimizer-db?address=0.0.0.0&port=3306"
+    config_dict['instance_connection_name'] = [prod_instance_conn, dev_instance_conn]
+
+    db_port = [ config_dict.get('prod_proxy_port'), config_dict.get('dev_proxy_port')]
+    config_dict['db_port'] = [ int(item) for item in db_port if item ]
+
+    return config_dict
+
 
     dir_path = os.path.dirname(os.path.abspath(path))
     config_path = os.path.join(dir_path, path)
@@ -134,6 +150,7 @@ def bind_ksa_gsa(project_id, ksa_name, service_account,
     args = ['gcloud', 'iam', 'service-accounts', 'add-iam-policy-binding', 
             '--role','roles/iam.workloadIdentityUser', 
             '--member', f'serviceAccount:{project_id}.svc.id.goog[default/{ksa_name}]', 
+            # serviceAccount:ratequote-349719.svc.id.goog[default/gke-composer-sa
             service_account
             ]
     if verbose > 2:
@@ -168,61 +185,128 @@ def annotate_ksa(ksa_name, service_account, verbose = 0):
     if verbose > 0:
         print(f'annotated binding between "{ksa_name}" and "{service_account}" ')
 
-def create_kubetcl_secret(db_secret_name,
+def create_kubetcl_secret(db_secret_name: list,
                           db_user_name,
                           db_name,
+                          project_id,
                           verbose = 0):
-    if verbose >1:
-        print('creating kubernetes secret')
-    args = ['kubectl', 'create', 'secret', 
-            'generic', db_secret_name, 
-            '--from-literal',f'username={db_user_name}', 
-            '--from-literal','password={PW}'.format(
-                PW= os.environ['PROXY_DB_PASSWORD']),
-            '--from-literal',f'database={db_name}'
-            ]
-    if verbose > 2:
-        _print_args(args)
-    result = subprocess.run(args, capture_output=True)
-    if result.returncode != 0:
-        already_exists = f'secrets "{db_secret_name}" already exists'
-        if already_exists in result.stderr.decode('utf8'):
-            if verbose > 0:
-                print(f'secret {db_secret_name} already exists')
-            return
-        else:
-            raise CreateProxyError(result.stderr.decode('utf8'))
-    if verbose > 0:
-        print(f'created secret for {db_secret_name}, for user {db_user_name} and database {db_name}')
+    PW_DEV = os.getenv('PROXY_DB_PASSWORD_DEV')
+    PW_PROD = os.getenv('PROXY_DB_PASSWORD_PROD')
+    if not PW_DEV and not PW_PROD:
+        raise RuntimeError("Missing env var for either: PROXY_DB_PASSWORD_DEV and/or PROXY_DB_PASSWORD_PROD! Both must be set!!")
+
+    for secret_name in db_secret_name:
+        PW= PW_DEV if "dev" in secret_name else PW_PROD
+        if verbose >1:
+            print('creating kubernetes secret')
+        args = ['kubectl', 'create', 'secret', 
+                'generic', secret_name, 
+                '--from-literal',f'username={db_user_name}', 
+                '--from-literal',f'password={PW}',
+                    # PW= os.environ['PROXY_DB_PASSWORD_DEV']),
+                '--from-literal',f'database={db_name}'
+                ]
+        if verbose > 2:
+            _print_args(args)
+        result = subprocess.run(args, capture_output=True)
+        if result.returncode != 0:
+            already_exists = f'secrets "{secret_name}" already exists'
+            if already_exists in result.stderr.decode('utf8'):
+                if verbose > 0:
+                    print(f'secret {secret_name} already exists')
+                return
+            else:
+                raise CreateProxyError(result.stderr.decode('utf8'))
+        if verbose > 0:
+            print(f'created secret for {secret_name}, for user {db_user_name} and database {db_name}')
+
+def build_env_yaml_list(db_secret_name:list):
+    out_list = []
+    for secret_name in db_secret_name:
+        env_str = "_DEV" if "dev" in secret_name else "_PROD"
+        out_list.append({ 'name': 'DB_USER'+env_str,
+            'valueFrom': {
+                'secretKeyRef': {
+                    'key': 'username',
+                    'name': secret_name
+                }
+            }
+        })
+        out_list.append({ 'name': 'DB_PASS'+env_str,
+            'valueFrom': {
+                'secretKeyRef': {
+                    'key': 'password',
+                    'name': secret_name}
+            }
+        })
+        out_list.append({ 'name': 'DB_NAME'+env_str,
+            'valueFrom': {
+                'secretKeyRef': {
+                    'key': 'database',
+                    'name': secret_name}
+            }
+        })
+    return out_list
+    
+
+    #  'env': [
+    #     {   'name': 'DB_USER',
+    #         'valueFrom': {
+    #             'secretKeyRef': {
+    #                 'key': 'username',
+    #                 'name': db_secret_name
+    #             }
+    #         }
+    #     },
+    #     {   'name': 'DB_PASS',
+    #         'valueFrom': {   'secretKeyRef': {   'key': 'password',
+    #                                             'name': db_secret_name}}},
+    #     {   'name': 'DB_NAME',
+    #         'valueFrom': {   'secretKeyRef': {   'key': 'database',
+    #                                             'name': db_secret_name}}}
+    # ]
+
+def build_instance_conn_yaml_list(instance_connection_name:list):
+    return ['--structured-logs', '--address=0.0.0.0'] + instance_connection_name
+    
+# ; "ratequote-349719:us-central1:call-optimizer-db?address=0.0.0.0&port=3307" \
+# ; "ratequotedev:us-central1:call-optimizer-db?address=0.0.0.0&port=3306"
+    # instance_connection_name
 
 def _get_sidecar_dict(work_dir,
                     deployment_name, 
                    cluster_name,
-                   db_secret_name,
+                   db_secret_name:list,
                    db_port,
-                   instance_connection_name,
+                   instance_connection_name:list,
                    ksa_name,
                    use_secret,
                    verbose = 0):
+
+
+
     if use_secret:
+        print("USING SECRET")
         return  {   'apiVersion': 'apps/v1',
     'kind': 'Deployment',
     'metadata': {'name': deployment_name},
     'spec': {   'selector': {'matchLabels': {'app': cluster_name}},
                 'template': {   'metadata': {   'labels': {   'app': cluster_name}},
-                                'spec': {   'containers': [   {   'args': [   '--structured-logs',
-                                                                              '--address=0.0.0.0',
-                                                                              f'--port={db_port}',
-                                                                              instance_connection_name],
-                                                                  'env': [   {   'name': 'DB_USER',
-                                                                                 'valueFrom': {   'secretKeyRef': {   'key': 'username',
-                                                                                                                      'name': db_secret_name}}},
-                                                                             {   'name': 'DB_PASS',
-                                                                                 'valueFrom': {   'secretKeyRef': {   'key': 'password',
-                                                                                                                      'name': db_secret_name}}},
-                                                                             {   'name': 'DB_NAME',
-                                                                                 'valueFrom': {   'secretKeyRef': {   'key': 'database',
-                                                                                                                      'name': db_secret_name}}}],
+                                'spec': {   'containers': [   {   'args': build_instance_conn_yaml_list(instance_connection_name),
+                                                                    # [   '--structured-logs',
+                                                                    #           '--address=0.0.0.0',
+                                                                    #           f'--port={db_port}',
+                                                                    #           instance_connection_name],
+                                                                #   'env': [   {   'name': 'DB_USER',
+                                                                #                  'valueFrom': {   'secretKeyRef': {   'key': 'username',
+                                                                #                                                       'name': db_secret_name}}},
+                                                                #              {   'name': 'DB_PASS',
+                                                                #                  'valueFrom': {   'secretKeyRef': {   'key': 'password',
+                                                                #                                                       'name': db_secret_name}}},
+                                                                #              {   'name': 'DB_NAME',
+                                                                #                  'valueFrom': {   'secretKeyRef': {   'key': 'database',
+                                                                #                                                       'name': db_secret_name}}}],
+                                                                  'env': build_env_yaml_list(db_secret_name),
                                                                   'image': 'gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.1.0',
                                                                   'name': 'cloud-sql-proxy',
                                                                   'resources': {   'requests': {   'cpu': '1',
@@ -234,10 +318,11 @@ def _get_sidecar_dict(work_dir,
     'metadata': {'name': deployment_name},
     'spec': {   'selector': {   'matchLabels': {   'app': cluster_name}},
                 'template': {   'metadata': {   'labels': {   'app': cluster_name}},
-                                'spec': {   'containers': [   {   'args': [   '--structured-logs',
-                                                                              '--address=0.0.0.0',
-                                                                              f'--port={db_port}',
-                                                                              instance_connection_name],
+                                'spec': {   'containers': [   {   'args': build_instance_conn_yaml_list(instance_connection_name),
+                                # 'spec': {   'containers': [   {   'args': [   '--structured-logs',
+                                                                            #   '--address=0.0.0.0',
+                                                                            #   f'--port={db_port}',
+                                                                            #   instance_connection_name],
                                                                   'image': 'gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.1.0',
                                                                   'name': 'cloud-sql-proxy',
                                                                   'resources': {   'requests': {   'cpu': '1',
@@ -282,71 +367,80 @@ def create_sidecar(work_dir,
         print(result.stdout.decode('utf8'))
 
 
-def create_sidecar_old(work_dir,
-                    deployment_name, 
-                   cluster_name,
-                   db_secret_name,
-                   db_port,
-                   instance_connection_name,
-                   ksa_name,
-                   just_yaml = False,
-                   verbose = 0):
-    if verbose >1:
-        print('creating sidecar')
-    d = {   'apiVersion': 'apps/v1',
-    'kind': 'Deployment',
-    'metadata': {'name': deployment_name},
-    'spec': {   'selector': {'matchLabels': {'app': cluster_name}},
-                'template': {   'metadata': {   'labels': {   'app': cluster_name}},
-                                'spec': {   'containers': [   {   'args': [   '--structured-logs',
-                                                                              '--address=0.0.0.0',
-                                                                              f'--port={db_port}',
-                                                                              instance_connection_name],
-                                                                  'env': [   {   'name': 'DB_USER',
-                                                                                 'valueFrom': {   'secretKeyRef': {   'key': 'username',
-                                                                                                                      'name': db_secret_name}}},
-                                                                             {   'name': 'DB_PASS',
-                                                                                 'valueFrom': {   'secretKeyRef': {   'key': 'password',
-                                                                                                                      'name': db_secret_name}}},
-                                                                             {   'name': 'DB_NAME',
-                                                                                 'valueFrom': {   'secretKeyRef': {   'key': 'database',
-                                                                                                                      'name': db_secret_name}}}],
-                                                                  'image': 'gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.1.0',
-                                                                  'name': 'cloud-sql-proxy',
-                                                                  'resources': {   'requests': {   'cpu': '1',
-                                                                                                   'memory': '2Gi'}},
-                                                                  'securityContext': {   'runAsNonRoot': True}}],
-                                            'serviceAccountName': ksa_name}}}}
+# def create_sidecar_old(work_dir,
+#                     deployment_name, 
+#                    cluster_name,
+#                    db_secret_name,
+#                    db_port,
+#                    instance_connection_name,
+#                    ksa_name,
+#                    just_yaml = False,
+#                    verbose = 0):
+#     if verbose >1:
+#         print('creating sidecar')
+#     d = {   'apiVersion': 'apps/v1',
+#     'kind': 'Deployment',
+#     'metadata': {'name': deployment_name},
+#     'spec': {   'selector': {'matchLabels': {'app': cluster_name}},
+#                 'template': {   'metadata': {   'labels': {   'app': cluster_name}},
+#                                 'spec': {   'containers': [   {   'args': [   '--structured-logs',
+#                                                                               '--address=0.0.0.0',
+#                                                                               f'--port={db_port}',
+#                                                                               instance_connection_name],
+#                                                                   'env': [   {   'name': 'DB_USER',
+#                                                                                  'valueFrom': {   'secretKeyRef': {   'key': 'username',
+#                                                                                                                       'name': db_secret_name}}},
+#                                                                              {   'name': 'DB_PASS',
+#                                                                                  'valueFrom': {   'secretKeyRef': {   'key': 'password',
+#                                                                                                                       'name': db_secret_name}}},
+#                                                                              {   'name': 'DB_NAME',
+#                                                                                  'valueFrom': {   'secretKeyRef': {   'key': 'database',
+#                                                                                                                       'name': db_secret_name}}}],
+#                                                                   'image': 'gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.1.0',
+#                                                                   'name': 'cloud-sql-proxy',
+#                                                                   'resources': {   'requests': {   'cpu': '1',
+#                                                                                                    'memory': '2Gi'}},
+#                                                                   'securityContext': {   'runAsNonRoot': True}}],
+#                                             'serviceAccountName': ksa_name}}}}
 
-    side_path = os.path.join(work_dir, 'proxy_with_workload_identity.yaml')
-    with open(side_path, 'w') as write_obj:
-        yaml.dump(d, write_obj)
-    if just_yaml:
-        print(f'created yaml "{side_path}"')
-        return
-    if verbose > 0:
-        print(f'created yaml "{side_path}"')
-    args = ['kubectl', 'apply', '-f',  side_path]  
-    if verbose >2:
-        _print_args(args)
-    result = _run_subprocess(args = args)
-    if verbose > 0:
-        print(f'created sidecar')
-        print(result.stdout.decode('utf8'))
+#     side_path = os.path.join(work_dir, 'proxy_with_workload_identity.yaml')
+#     with open(side_path, 'w') as write_obj:
+#         yaml.dump(d, write_obj)
+#     if just_yaml:
+#         print(f'created yaml "{side_path}"')
+#         return
+#     if verbose > 0:
+#         print(f'created yaml "{side_path}"')
+#     args = ['kubectl', 'apply', '-f',  side_path]  
+#     if verbose >2:
+#         _print_args(args)
+#     result = _run_subprocess(args = args)
+#     if verbose > 0:
+#         print(f'created sidecar')
+#         print(result.stdout.decode('utf8'))
+
+def build_ports_list_yaml(db_port:list)-> list:
+    return [ 
+        {
+            'name': 'dev' if port == 3306 else 'prod',
+            'port': port, 'protocol': 'TCP', 'targetPort': port
+        } for port in db_port]
+
 
 def create_service(work_dir,
                     deployment_name, 
                    cluster_name,
-                   db_port,
+                   db_port:list,
                    just_yaml = False,
                    verbose = 0):
     d = {   'apiVersion': 'v1',
     'kind': 'Service',
     'metadata': {   'labels': {'run': f'{deployment_name}-service'},
                     'name': f'{deployment_name}-service'},
-    'spec': {   'ports': [   {   'port': db_port,
-                                 'protocol': 'TCP',
-                                 'targetPort': db_port}],
+    'spec': {   'ports': build_ports_list_yaml(db_port),
+    # 'spec': {   'ports': [   {   'port': db_port,
+                                #  'protocol': 'TCP',
+                                #  'targetPort': db_port}],
                 'selector': {'app': cluster_name},
                 'type': 'ClusterIP'}}
     path = os.path.join(work_dir, 'service.yaml')
@@ -418,6 +512,7 @@ def main(config_path, verbose, use_secret):
         create_kubetcl_secret(db_secret_name = configs['db_secret_name'],
                               db_user_name = configs['db_user_name'],
                               db_name = configs['db_name'],
+                              project_id=configs['project_id'],
                               verbose = verbose
                               )
     create_workload_identity(cluster_name = configs['cluster_name'],
@@ -448,7 +543,7 @@ def main(config_path, verbose, use_secret):
     create_service(work_dir,
                     deployment_name = configs['deployment_name'], 
                    cluster_name = configs['cluster_name'],
-                   db_port = int(configs['db_port']),
+                   db_port = configs['db_port'],
                    verbose = verbose)
 
 if __name__ == '__main__':

@@ -21,21 +21,61 @@ gcloud components install gke-gcloud-auth-plugin
 
 3. Create a config.ini file. See the examples
 
-  * `ksa_name` can be anything you want
-  *  `cluster_name` the name of the cluster
-  *  `region_name` name of region id of your cluster
-  * `deployment_name` can be anyhting
-  * `db_secret_name` Optional, only if you need to create a kubernetes secret; can be anyting
-  * `db_name` Optional, only use if creating a kuberntes secret; the name of db you are connecting to
-  * `db_user_name` Optional, only use if creating a kuberntes secret; the name of db user you are connecting to
-  * `db_port` port of instance
-  * `instance_connection_name` the name of your Cloud SQL instance, found in GCP console
-  * `service_account` can be anything
-  * `project_id` project id
+  * `ksa_name`
+    * ~~can be anything you want~~
+    * Ideally name this as a recognized able Service Acct (SA) on GKE/K8s
+  *  `cluster_name`
+    * the name of the cluster
+  *  `region_name` 
+    * name of region id of your cluster
+  * `deployment_name`
+    * ~~can be anything~~
+    * Ideally name this as a recognize-able GKE deployment
+  * ~~`db_secret_name`~~
+    * ~~Optional, only if you need to create a kubernetes secret; can be anyting~~
+  * `db_prod_secret_name`
+    * Name (only descriptor) for the secret to create in GKE/K8s
+    * If this is specified, the following is used to create the keys (like key-value pair) for the secret
+      * `db_name`
+      * `db_user_name`
+      * Currently does NOT allow for different names of the secrets across env
+  * `db_dev_secret_name`
+    * Like `db_prod_secret_name` except to name the dev secret(s)
+  * `db_instance`
+    * Name of the db instance from cloud sql to determine instance connection string (ex. `call-optimizer-db`)
+  * `prod_project` 
+  * `prod_proxy_port`
+    * Port to assign to the cloud sql proxy connection instance str, only affects how clients connect to the proxy for connection to PROD
+  * `dev_project`
+  * `dev_proxy_port`
+    * Port to assign to the cloud sql proxy connection instance str, only affects how clients connect to the proxy for connection to DEV
+  * `db_name`
+    * ~~Optional, only use if creating a kuberntes secret; the name of db you are connecting to~~
+    * Specify when using a `*_secret_name` config to specify the `*_secret_name.database` secret value
+  * `db_user_name`
+    * ~~Optional, only use if creating a kuberntes secret; the name of db user you are connecting to~~
+    * Specify when using a `*_secret_name` config to specify the `*_secret_name.username` secret 
+  ~~* `db_port` port of instance~~
+  ~~* `instance_connection_name` the name of your Cloud SQL instance, found in GCP console~~
+  * `service_account`
+    * ~~can be anything~~
+    * Set to the NAME of the GCP SA that should be able to access the proxy
+      * Just the name (ex. `airflow-bq`) so before the `@<project_id>@iam.google...`
+  * `project_id`
+    * project id to create the proxy deployment/service in this project's GKE cluster
+
+  ### IMPORTANT
+  ++++++++++++++++
+  * An implict configuration is required via: `PROXY_DB_PASSWORD_DEV` and `PROXY_DB_PASSWORD_PROD`
+    * must be set as env var of the machine running the ~/scripts/create.py
+    * These are set dynamically to the appropriate `*_secret_name` based on the presence of either `dev` or `prod`
+  
+  ++++++++++++++++    
 
 4. Run python scripts/create.py `<path to config>` 
   * use the -v option for verbosity. Default is no messaging. Use 1, 2, or 3 for more verbosity
   * use the -s or --use-secret if you want to create s kubernetes secret
+  * use the --yaml / -y flag to build the yaml used to create the GKE infra for validation prior to execution
 
 
 Testing
@@ -103,3 +143,22 @@ can't communicate with ech other. Instead, you need the full name: <service_name
 3. Google documentation does not state you need to create a service, but apparently, you do. I followed the configuration for airflow-sqlproxy, which needed a service.
 
 4. Google documentation for the yaml file (sidecar) would not work. I had to bind the address of "0.0.0.0" to the proxy to get the service recognized. 
+
+
+Collin Notes
+============
+
+* ![connection image](./images/connection.png)
+  * Means to connect to airflow cluster:
+  ```shell
+  kubectl --namespace=composer-2-9-3-airflow-2-9-1-07288168 exec -it airflow-worker-wvnjk bash
+  ```
+  * Means to connect to the SQL Proxy while on Airflow (useful/required for jobs on airflow)
+  ```shell
+  psql -h sql-proxy-deployment-service.default.svc.cluster.local --user postgres -p 3306 -d realtime-bidding
+  ```
+    * `psql-client` seems to exist on Airflow cluster
+    * The `sql-proxy-deployment-service.default.svc.cluster.local` is the location of the proxy host
+      * The port differentiates whether it will connect to PROD or DEV:
+        * `-p 3306` --> DEV
+        * `-p 3307` --> PROD
