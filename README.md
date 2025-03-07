@@ -7,6 +7,19 @@ seem outdated. Recent versions of Composer use namespaces in kubernetes, so much
 
 The script will create a sql proxy connection for workload identity with the sidecar pattern. 
 
+### Ratequote / Collin Modification
+* Updated the `~/scripts/create.py` to handle the use case for the PG Replication
+  * It creates the GKE `Deployment` and attached `Service` which uses:
+    * A single GKE SA (`ksa_name`) linked to a single GCP SA (`service_account`)
+    * To create a single workload/Deployment in GKE
+      * Within the `Deployment` it exposes the `cloud-sql-proxy` via the Google cloud sql proxy image
+      * It establishes TWO instances to be available:
+        * @ `0.0.0.0:3306` --> DEV DB Connection
+        * @ `0.0.0.0:3307` --> PROD DB Connection
+    * The `Service` attached to the deployment also enables these ports as open/exposed within a single `Service`
+      * `3306` --> `name:dev`
+      * `3307` --> `name:prod`
+
 
 Detailed Creation
 =================
@@ -162,3 +175,14 @@ Collin Notes
       * The port differentiates whether it will connect to PROD or DEV:
         * `-p 3306` --> DEV
         * `-p 3307` --> PROD
+* Docker cloud-sql-proxy image (GCP Provided)
+  * Docker run local command and syntax to mimic for Deployment on GKE
+  ```shell
+  docker run -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/keys/g_creds.json \
+      -v $GOOGLE_APPLICATION_CREDENTIALS:/tmp/keys/g_creds.json:ro \
+      -p 3307:3307 -p 3306:3306 \
+      gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.1.0 \
+      --credentials-file /tmp/keys/g_creds.json \
+      "ratequote-349719:us-central1:call-optimizer-db?address=0.0.0.0&port=3307" \
+      "ratequotedev:us-central1:call-optimizer-db?address=0.0.0.0&port=3306"
+  ```
